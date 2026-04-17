@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ZERO Grid Assistant v0.4
+// @name         ZERO Grid Assistant v0.6
 // @namespace    local.zero.grid.assistant
-// @version      0.4.0
-// @description  Assistives Grid-Overlay mit automatischem Bestands-Readout, 500€-Mindestvolumen und manueller Freigabe
+// @version      0.6.0
+// @description  Assistives Grid-Overlay mit URL-basierten Orderlinks, 500€-Mindestvolumen, Auto-Bestandslesung und Selector-Debugger
 // @match        https://mein.finanzen-zero.net/*
 // @match        https://*.finanzen-zero.net/*
 // @grant        none
@@ -13,56 +13,17 @@
 
   const CONFIG = {
     minNotional: 500,
-    preferGermanDecimal: true,
-    autoScanOrderForm: true,
+    preferGermanDecimal: false,
     autoReadHolding: true,
-    symbol: 'ETF',
-    anchor: 100.00,
+    symbol: 'US0079031078',
+    anchor: 236.00,
     step: 0.50,
     qty: 1,
     manualAvailableQty: '',
+    orderPath: '/meindepot/kaufenverkaufen',
+    openLinksInNewTab: true,
 
     selectors: {
-      orderModal: [
-        '[data-testid*="order"]',
-        '[data-testid*="Order"]',
-        '[class*="order"]',
-        '[class*="Order"]',
-        'form',
-        '[role="dialog"]'
-      ],
-      priceInput: [
-        'input[name*="price" i]',
-        'input[name*="limit" i]',
-        'input[placeholder*="Preis" i]',
-        'input[aria-label*="Preis" i]',
-        'input[inputmode="decimal"]'
-      ],
-      qtyInput: [
-        'input[name*="qty" i]',
-        'input[name*="quantity" i]',
-        'input[name*="stück" i]',
-        'input[placeholder*="Stück" i]',
-        'input[aria-label*="Stück" i]',
-        'input[inputmode="numeric"]'
-      ],
-      buySellTabs: {
-        buy: [
-          '[data-testid*="buy"]',
-          '[data-testid*="Buy"]',
-          'button[aria-label*="Kauf"]',
-          'button[aria-label*="Buy"]',
-          'button'
-        ],
-        sell: [
-          '[data-testid*="sell"]',
-          '[data-testid*="Sell"]',
-          'button[aria-label*="Verkauf"]',
-          'button[aria-label*="Sell"]',
-          'button'
-        ]
-      },
-
       positionContainers: [
         'tr',
         '[role="row"]',
@@ -91,9 +52,12 @@
     autoAvailableQty: null,
     lastPrice: null,
     panelOpen: true,
-    lastOrderScan: 'Noch nicht gesucht',
     lastHoldingScan: 'Noch nicht gesucht',
-    formRef: null
+    selectorDebugActive: false,
+    lastSelectorInfo: null,
+    hoverTarget: null,
+    lastBuyUrl: '',
+    lastSellUrl: ''
   };
 
   const fmt = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
@@ -149,11 +113,8 @@
     const hasDot = s.includes('.');
 
     if (hasComma && hasDot) {
-      if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
-        s = s.replace(/\./g, '').replace(',', '.');
-      } else {
-        s = s.replace(/,/g, '');
-      }
+      if (s.lastIndexOf(',') > s.lastIndexOf('.')) s = s.replace(/\./g, '').replace(',', '.');
+      else s = s.replace(/,/g, '');
     } else if (hasComma) {
       s = s.replace(/\./g, '').replace(',', '.');
     } else {
@@ -163,6 +124,14 @@
 
     const n = Number(s);
     return Number.isFinite(n) ? n : NaN;
+  }
+
+  function cssEscapeSafe(v) {
+    try {
+      return CSS.escape(v);
+    } catch (_) {
+      return String(v).replace(/["\\]/g, '\\$&');
+    }
   }
 
   function grid(anchor, step) {
@@ -204,22 +173,6 @@
     return { ok: available >= required, required, available };
   }
 
-  function numberToInputString(v) {
-    const s = round2(v).toFixed(2);
-    return CONFIG.preferGermanDecimal ? s.replace('.', ',') : s;
-  }
-
-  function setNativeValue(el, value) {
-    const prototype = Object.getPrototypeOf(el);
-    const desc = Object.getOwnPropertyDescriptor(prototype, 'value');
-    if (desc && desc.set) desc.set.call(el, value);
-    else el.value = value;
-
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'End' }));
-  }
-
   function flash(msg, type = 'ok') {
     const el = byId('zga-flash');
     if (!el) return;
@@ -230,85 +183,11 @@
     flash._t = setTimeout(() => { el.hidden = true; }, 3500);
   }
 
-  function findByText(candidates, needles) {
-    for (const needle of needles) {
-      const low = needle.toLowerCase();
-      const hit = candidates.find(el => normalizeText(el.innerText || el.textContent).includes(low));
-      if (hit) return hit;
-    }
-    return null;
-  }
-
-  function findOrderForm() {
-    const candidates = qsa(CONFIG.selectors.orderModal).filter(visible);
-    if (!candidates.length) return null;
-
-    for (const c of candidates) {
-      const inputs = [...c.querySelectorAll('input')].filter(visible);
-      if (inputs.length >= 2) return c;
-    }
-    return candidates[0] || null;
-  }
-
-  function findField(root, selectorList, labelWords) {
-    const direct = qsa(selectorList, root).filter(visible);
-    if (direct.length) return direct[0];
-
-    const allInputs = [...root.querySelectorAll('input')].filter(visible);
-    for (const input of allInputs) {
-      const id = input.id;
-      const lbl = id
-        ? root.querySelector(`label[for="${CSS.escape(id)}"]`) || document.querySelector(`label[for="${CSS.escape(id)}"]`)
-        : null;
-
-      const hay = normalizeText([
-        input.getAttribute('name') || '',
-        input.getAttribute('placeholder') || '',
-        input.getAttribute('aria-label') || '',
-        lbl ? (lbl.innerText || lbl.textContent || '') : ''
-      ].join(' '));
-
-      if (labelWords.some(w => hay.includes(w))) return input;
-    }
-    return null;
-  }
-
-  function findActionTab(root, side) {
-    const selectors = side === 'buy' ? CONFIG.selectors.buySellTabs.buy : CONFIG.selectors.buySellTabs.sell;
-    const candidates = qsa(selectors, root).filter(visible);
-    return findByText(candidates, side === 'buy' ? ['kauf', 'buy'] : ['verkauf', 'sell']);
-  }
-
-  function scanOrderForm() {
-    const form = findOrderForm();
-    if (!form) {
-      state.formRef = null;
-      state.lastOrderScan = 'Keine Ordermaske erkannt';
-      updateView();
-      return null;
-    }
-
-    const priceInput = findField(form, CONFIG.selectors.priceInput, ['preis', 'price', 'limit']);
-    const qtyInput = findField(form, CONFIG.selectors.qtyInput, ['stück', 'qty', 'quantity', 'anzahl']);
-    const buyTab = findActionTab(form, 'buy');
-    const sellTab = findActionTab(form, 'sell');
-
-    state.formRef = { form, priceInput, qtyInput, buyTab, sellTab };
-    state.lastOrderScan =
-      `Maske erkannt | Preis: ${!!priceInput} | Menge: ${!!qtyInput} | Kauf: ${!!buyTab} | Verkauf: ${!!sellTab}`;
-    updateView();
-    return state.formRef;
-  }
-
-  function ensureFormRef() {
-    return state.formRef || scanOrderForm();
-  }
-
   function buildNeedles() {
     const raw = String(state.symbol || '').trim();
     if (!raw) return [];
     return raw
-      .split(/[|,/]+/)
+      .split(/[|,/ ]+/)
       .map(s => normalizeText(s))
       .filter(Boolean);
   }
@@ -318,7 +197,7 @@
     for (const n of needles) {
       if (text.includes(n)) score += 5;
     }
-    if (/\b(bestand|stück|stk|menge|position)\b/i.test(text)) score += 3;
+    if (/\b(bestand|stück|stk|menge|position|anteile?)\b/i.test(text)) score += 3;
     score -= Math.min(text.length / 400, 3);
     return score;
   }
@@ -381,93 +260,108 @@
       }
     }
 
-    const bodyText = normalizeText(document.body?.innerText || '');
-    if (needles.some(n => bodyText.includes(n))) {
-      const qty = extractQtyFromText(bodyText);
-      if (Number.isFinite(qty)) {
-        state.autoAvailableQty = qty;
-        state.lastHoldingScan = `Bestand global erkannt: ${qty} Stk`;
-        updateView();
-        return qty;
-      }
-    }
-
     state.autoAvailableQty = null;
     state.lastHoldingScan = `Kein Bestand für "${state.symbol}" erkannt`;
     updateView();
     return null;
   }
 
-  function fillOrder(side) {
-    const ref = ensureFormRef();
-    if (!ref || !ref.form) {
-      flash('Keine Ordermaske gefunden.', 'warn');
+  function buildOrderUrl({ isin, direction, quantity, execType = 'limit', limitPrice }) {
+    const url = new URL(CONFIG.orderPath, location.origin);
+    url.searchParams.set('isin', String(isin).trim());
+    url.searchParams.set('direction', String(direction).trim());
+    url.searchParams.set('quantity', String(quantity).trim());
+    url.searchParams.set('execType', String(execType).trim());
+    url.searchParams.set('limitPrice', String(round2(limitPrice)));
+    return url.toString();
+  }
+
+  function computeOrder(side) {
+    const g = grid(state.anchor, state.step);
+    const price = side === 'buy' ? g.buy : g.sell;
+    const quantity = side === 'buy' ? requiredBuyQty(price) : requiredSellQty(price);
+    const notional = round2(price * quantity);
+
+    return {
+      side,
+      isin: String(state.symbol || '').trim(),
+      price,
+      quantity,
+      notional,
+      url: buildOrderUrl({
+        isin: String(state.symbol || '').trim(),
+        direction: side,
+        quantity,
+        execType: 'limit',
+        limitPrice: price
+      })
+    };
+  }
+
+  function openPreparedOrder(side) {
+    const order = computeOrder(side);
+
+    if (!order.isin) {
+      flash('Bitte eine ISIN eintragen.', 'warn');
       return;
     }
 
-    const g = grid(state.anchor, state.step);
-    const price = side === 'buy' ? g.buy : g.sell;
-    const qty = side === 'buy' ? requiredBuyQty(price) : requiredSellQty(price);
-
     if (side === 'sell') {
-      const sellCheck = canSellAt500(price);
+      const sellCheck = canSellAt500(order.price);
       if (!sellCheck.ok) {
         flash(
-          `Verkauf blockiert: Für ${fmt.format(CONFIG.minNotional)} bei ${fmt.format(price)} brauchst du ${sellCheck.required} Stk, verfügbar sind nur ${sellCheck.available} Stk.`,
+          `Verkauf blockiert: Für ${fmt.format(CONFIG.minNotional)} bei ${fmt.format(order.price)} brauchst du ${sellCheck.required} Stk, verfügbar sind nur ${sellCheck.available} Stk.`,
           'error'
         );
         return;
       }
     }
 
-    const notional = round2(price * qty);
-
-    if (side === 'buy' && ref.buyTab) ref.buyTab.click();
-    if (side === 'sell' && ref.sellTab) ref.sellTab.click();
-
-    if (ref.priceInput) {
-      ref.priceInput.focus();
-      setNativeValue(ref.priceInput, numberToInputString(price));
-    }
-    if (ref.qtyInput) {
-      ref.qtyInput.focus();
-      setNativeValue(ref.qtyInput, String(qty));
-    }
+    if (CONFIG.openLinksInNewTab) window.open(order.url, '_blank', 'noopener');
+    else location.href = order.url;
 
     flash(
-      `${side === 'buy' ? 'Kauf' : 'Verkauf'} vorbereitet: ${numberToInputString(price)} × ${qty} = ${fmt.format(notional)}`,
+      `${side === 'buy' ? 'Kauf' : 'Verkauf'}-Link geöffnet: ${fmt.format(order.price)} × ${order.quantity} = ${fmt.format(order.notional)}. Bitte manuell prüfen und freigeben.`,
       'ok'
     );
-    byId('zga-hint').textContent =
-      `${side === 'buy' ? 'Kauf' : 'Verkauf'} vorbereitet: Preis ${fmt.format(price)}, Menge ${qty}, Volumen ${fmt.format(notional)}. Kein Auto-Submit.`;
+  }
+
+  function copyOrderUrl(side) {
+    const order = computeOrder(side);
+    if (!order.isin) {
+      flash('Bitte eine ISIN eintragen.', 'warn');
+      return;
+    }
+    navigator.clipboard.writeText(order.url).then(() => flash(`${side === 'buy' ? 'Kauf' : 'Verkauf'}-URL kopiert.`, 'ok'));
   }
 
   function copyPlan() {
     const g = grid(state.anchor, state.step);
-    const buyQty = requiredBuyQty(g.buy);
-    const sellQty = requiredSellQty(g.sell);
+    const buy = computeOrder('buy');
+    const sell = computeOrder('sell');
     const available = getEffectiveAvailableQty();
 
     const text =
-`Symbol/WKN/ISIN-Suchtext: ${state.symbol}
+`ISIN: ${buy.isin}
 Anchor: ${state.anchor.toFixed(2)}
 Abstand: ${state.step.toFixed(2)}
 
 Kauf:
-- Preis: ${g.buy.toFixed(2)}
-- Menge für >= ${CONFIG.minNotional} €: ${buyQty}
-- Volumen: ${(g.buy * buyQty).toFixed(2)} €
+- Preis: ${buy.price.toFixed(2)}
+- Menge für >= ${CONFIG.minNotional} €: ${buy.quantity}
+- Volumen: ${buy.notional.toFixed(2)} €
+- URL: ${buy.url}
 
 Verkauf:
-- Preis: ${g.sell.toFixed(2)}
-- Menge für >= ${CONFIG.minNotional} €: ${sellQty}
-- Volumen: ${(g.sell * sellQty).toFixed(2)} €
+- Preis: ${sell.price.toFixed(2)}
+- Menge für >= ${CONFIG.minNotional} €: ${sell.quantity}
+- Volumen: ${sell.notional.toFixed(2)} €
 - Verfügbarer Bestand: ${available == null ? 'unbekannt' : available}
+- URL: ${sell.url}
 
 Nach Verkauf bei ${g.sell.toFixed(2)}:
-- Alte Kauforder ${g.buy.toFixed(2)} manuell prüfen/löschen
-- Neue Kauforder ${g.nextBuyAfterSell.toFixed(2)} vorbereiten
-- Neue Verkaufsorder ${g.nextSellAfterSell.toFixed(2)} vorbereiten
+- Neue Kauforder auf ${g.nextBuyAfterSell.toFixed(2)}
+- Neue Verkaufsorder auf ${g.nextSellAfterSell.toFixed(2)}
 
 Hinweis:
 - Finale Prüfung und Freigabe immer manuell
@@ -476,18 +370,217 @@ Hinweis:
     navigator.clipboard.writeText(text).then(() => flash('Ablauf kopiert.', 'ok'));
   }
 
+  function describeElement(el) {
+    const attrs = ['id', 'name', 'type', 'placeholder', 'aria-label', 'role', 'data-testid'];
+    const out = [];
+    for (const a of attrs) {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (v) out.push(`${a}="${v}"`);
+    }
+    return out.join(' | ') || '<keine markanten Attribute>';
+  }
+
+  function uniqueSelectorTest(sel, el) {
+    try {
+      const nodes = document.querySelectorAll(sel);
+      return nodes.length === 1 && nodes[0] === el;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function buildNthOfTypeSelector(el) {
+    const parts = [];
+    let cur = el;
+
+    while (cur && cur.nodeType === 1 && cur !== document.body) {
+      let part = cur.tagName.toLowerCase();
+      const siblings = Array.from(cur.parentElement?.children || []).filter(x => x.tagName === cur.tagName);
+      if (siblings.length > 1) {
+        const idx = siblings.indexOf(cur) + 1;
+        part += `:nth-of-type(${idx})`;
+      }
+      parts.unshift(part);
+      const sel = parts.join(' > ');
+      try {
+        if (document.querySelectorAll(sel).length === 1) return sel;
+      } catch (_) {}
+      cur = cur.parentElement;
+    }
+
+    return parts.join(' > ');
+  }
+
+  function buildCandidateSelectors(el) {
+    const cands = [];
+    const tag = el.tagName.toLowerCase();
+
+    if (el.id) cands.push(`#${cssEscapeSafe(el.id)}`);
+
+    const dt = el.getAttribute('data-testid');
+    if (dt) cands.push(`[data-testid="${cssEscapeSafe(dt)}"]`);
+
+    const name = el.getAttribute('name');
+    if (name) cands.push(`${tag}[name="${cssEscapeSafe(name)}"]`);
+
+    const aria = el.getAttribute('aria-label');
+    if (aria) cands.push(`${tag}[aria-label="${cssEscapeSafe(aria)}"]`);
+
+    const ph = el.getAttribute('placeholder');
+    if (ph) cands.push(`${tag}[placeholder="${cssEscapeSafe(ph)}"]`);
+
+    const type = el.getAttribute('type');
+    if (type) cands.push(`${tag}[type="${cssEscapeSafe(type)}"]`);
+
+    const cls = Array.from(el.classList || []).filter(c => c && !/\d{3,}/.test(c)).slice(0, 3);
+    if (cls.length) cands.push(`${tag}.${cls.map(cssEscapeSafe).join('.')}`);
+
+    if (name && type) cands.push(`${tag}[name="${cssEscapeSafe(name)}"][type="${cssEscapeSafe(type)}"]`);
+    if (name && ph) cands.push(`${tag}[name="${cssEscapeSafe(name)}"][placeholder="${cssEscapeSafe(ph)}"]`);
+    if (aria && type) cands.push(`${tag}[aria-label="${cssEscapeSafe(aria)}"][type="${cssEscapeSafe(type)}"]`);
+
+    cands.push(buildNthOfTypeSelector(el));
+
+    const unique = [];
+    for (const sel of cands) {
+      if (!sel || unique.some(x => x.selector === sel)) continue;
+      unique.push({ selector: sel, unique: uniqueSelectorTest(sel, el) });
+    }
+
+    unique.sort((a, b) => {
+      if (a.unique !== b.unique) return a.unique ? -1 : 1;
+      return a.selector.length - b.selector.length;
+    });
+
+    return unique.slice(0, 8);
+  }
+
+  function ensureHighlighter() {
+    if (byId('zga-selector-highlight')) return;
+    const hl = document.createElement('div');
+    hl.id = 'zga-selector-highlight';
+    hl.style.cssText = `
+      position: fixed;
+      z-index: 2147483646;
+      pointer-events: none;
+      border: 2px solid #0077ff;
+      background: rgba(0,119,255,.08);
+      border-radius: 6px;
+      display: none;
+    `;
+    document.body.appendChild(hl);
+  }
+
+  function highlightElement(el) {
+    ensureHighlighter();
+    const hl = byId('zga-selector-highlight');
+    if (!el || !visible(el)) {
+      hl.style.display = 'none';
+      return;
+    }
+    const r = el.getBoundingClientRect();
+    hl.style.display = 'block';
+    hl.style.left = `${r.left}px`;
+    hl.style.top = `${r.top}px`;
+    hl.style.width = `${r.width}px`;
+    hl.style.height = `${r.height}px`;
+  }
+
+  function renderSelectorInfo(info) {
+    const box = byId('zga-selector-debug-output');
+    if (!box) return;
+
+    if (!info) {
+      box.innerHTML = '<div class="zga-small">Noch kein Element gewählt.</div>';
+      return;
+    }
+
+    const rows = info.selectors.map((x, idx) => `
+      <div class="zga-sel-row">
+        <div class="zga-sel-meta">${idx === 0 ? 'Top' : 'Alt'} ${x.unique ? '· eindeutig' : '· nicht eindeutig'}</div>
+        <code>${escapeHtml(x.selector)}</code>
+        <button type="button" data-copy-selector="${idx}">Kopieren</button>
+      </div>
+    `).join('');
+
+    box.innerHTML = `
+      <div class="zga-small"><strong>Element:</strong> ${escapeHtml(info.tag)}</div>
+      <div class="zga-small">${escapeHtml(info.desc)}</div>
+      <div class="zga-small">Text: ${escapeHtml(info.textSnippet)}</div>
+      <div class="zga-sel-list">${rows}</div>
+    `;
+
+    box.querySelectorAll('[data-copy-selector]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const idx = Number(btn.getAttribute('data-copy-selector'));
+        const sel = info.selectors[idx]?.selector;
+        if (!sel) return;
+        navigator.clipboard.writeText(sel).then(() => flash('Selector kopiert.', 'ok'));
+      });
+    });
+  }
+
+  function inspectElement(el) {
+    if (!el) return;
+    const info = {
+      tag: el.tagName.toLowerCase(),
+      desc: describeElement(el),
+      textSnippet: normalizeText(el.innerText || el.textContent || '').slice(0, 120) || '<kein sichtbarer Text>',
+      selectors: buildCandidateSelectors(el)
+    };
+    state.lastSelectorInfo = info;
+    renderSelectorInfo(info);
+    highlightElement(el);
+  }
+
+  function onDebugMouseMove(ev) {
+    if (!state.selectorDebugActive) return;
+    const el = ev.target;
+    if (!el || el.closest('#zero-grid-assistant')) return;
+    state.hoverTarget = el;
+    highlightElement(el);
+  }
+
+  function onDebugClick(ev) {
+    if (!state.selectorDebugActive) return;
+    const el = ev.target;
+    if (!el || el.closest('#zero-grid-assistant')) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    ev.stopImmediatePropagation();
+    inspectElement(el);
+  }
+
+  function setSelectorDebug(active) {
+    state.selectorDebugActive = active;
+    const btn = byId('zga-selector-debug-toggle');
+    if (btn) btn.textContent = active ? 'Selector-Debugger beenden' : 'Selector-Debugger starten';
+    if (!active) highlightElement(null);
+    flash(active ? 'Selector-Debugger aktiv: Klicke auf ein Element.' : 'Selector-Debugger beendet.', 'ok');
+  }
+
+  function updateOrderUrls() {
+    try {
+      state.lastBuyUrl = computeOrder('buy').url;
+      state.lastSellUrl = computeOrder('sell').url;
+    } catch (_) {
+      state.lastBuyUrl = '';
+      state.lastSellUrl = '';
+    }
+  }
+
   function buildPanel() {
     const panel = document.createElement('div');
     panel.id = 'zero-grid-assistant';
     panel.innerHTML = `
       <div class="zga-header">
-        <strong>ZERO Grid Assistant v0.4</strong>
+        <strong>ZERO Grid Assistant v0.6</strong>
         <button id="zga-toggle" type="button">${state.panelOpen ? '–' : '+'}</button>
       </div>
 
       <div class="zga-body" ${state.panelOpen ? '' : 'hidden'}>
-        <label>Symbol / WKN / ISIN
-          <input id="zga-symbol" type="text" value="${escapeHtml(state.symbol)}" placeholder="z.B. A1JX52 oder Vanguard FTSE All-World">
+        <label>ISIN
+          <input id="zga-symbol" type="text" value="${escapeHtml(state.symbol)}" placeholder="z.B. US0079031078">
         </label>
 
         <div class="zga-cols">
@@ -524,33 +617,35 @@ Hinweis:
         </div>
 
         <div class="zga-status">
-          <div><strong>Order-Scan:</strong> <span id="zga-order-scan-status">-</span></div>
           <div><strong>Bestands-Scan:</strong> <span id="zga-holding-scan-status">-</span></div>
           <div id="zga-hint">Nur Vorbelegung. Kein Auto-Submit.</div>
         </div>
 
         <div class="zga-actions">
-          <button id="zga-scan-order" type="button">Maske suchen</button>
           <button id="zga-read-holding" type="button">Bestand lesen</button>
-          <button id="zga-apply-buy" type="button">Kauf vorbefüllen</button>
-          <button id="zga-apply-sell" type="button">Verkauf vorbefüllen</button>
-          <button id="zga-copy-buy" type="button">Kaufpreis kopieren</button>
-          <button id="zga-copy-sell" type="button">Verkaufspreis kopieren</button>
           <button id="zga-copy-plan" type="button">Ablauf kopieren</button>
+          <button id="zga-open-buy" type="button">Kauf-Link öffnen</button>
+          <button id="zga-open-sell" type="button">Verkauf-Link öffnen</button>
+          <button id="zga-copy-buy" type="button">Kauf-URL kopieren</button>
+          <button id="zga-copy-sell" type="button">Verkauf-URL kopieren</button>
+          <button id="zga-selector-debug-toggle" type="button">Selector-Debugger starten</button>
+        </div>
+
+        <div class="zga-debug-box">
+          <div class="zga-debug-head">Kauf-URL</div>
+          <code id="zga-buy-url"></code>
+          <div class="zga-debug-head" style="margin-top:10px;">Verkauf-URL</div>
+          <code id="zga-sell-url"></code>
+        </div>
+
+        <div class="zga-debug-box">
+          <div class="zga-debug-head">Selector-Debugger</div>
+          <div id="zga-selector-debug-output">
+            <div class="zga-small">Noch kein Element gewählt.</div>
+          </div>
         </div>
 
         <div id="zga-flash" class="zga-flash" hidden></div>
-
-        <details>
-          <summary>Hinweise</summary>
-          <p class="zga-small">
-            Trage im Feld „Symbol / WKN / ISIN“ möglichst einen eindeutigen Suchbegriff ein.
-            WKN oder ISIN ist meist robuster als nur der ETF-Name.
-          </p>
-          <p class="zga-small">
-            Wenn der Auto-Bestand nicht erkannt wird, kannst du weiterhin einen manuellen Override eintragen.
-          </p>
-        </details>
       </div>
     `;
     document.body.appendChild(panel);
@@ -562,7 +657,7 @@ Hinweis:
         top: 16px;
         right: 16px;
         z-index: 2147483647;
-        width: 400px;
+        width: 440px;
         max-width: calc(100vw - 24px);
         background: #fff;
         color: #111;
@@ -613,11 +708,16 @@ Hinweis:
         background: #f7f7f7;
         border-radius: 10px;
       }
-      #zero-grid-assistant .zga-status {
+      #zero-grid-assistant .zga-status,
+      #zero-grid-assistant .zga-debug-box {
         padding: 10px;
         background: #fbfbfb;
         border: 1px solid #ececec;
         border-radius: 10px;
+      }
+      #zero-grid-assistant .zga-debug-head {
+        font-weight: 600;
+        margin-bottom: 8px;
       }
       #zero-grid-assistant .zga-actions {
         display: grid;
@@ -636,6 +736,15 @@ Hinweis:
         cursor: pointer;
       }
       #zero-grid-assistant button:hover { background: #f0f0f0; }
+      #zero-grid-assistant code {
+        display: block;
+        white-space: pre-wrap;
+        word-break: break-all;
+        font-size: 12px;
+        background: #f5f5f5;
+        padding: 8px;
+        border-radius: 8px;
+      }
       #zero-grid-assistant .zga-flash {
         padding: 8px 10px;
         border-radius: 8px;
@@ -659,11 +768,24 @@ Hinweis:
       #zero-grid-assistant .zga-small {
         font-size: 12px;
         color: #555;
-        margin: 8px 0 0;
+        margin: 4px 0 0;
       }
-      #zero-grid-assistant details summary {
-        cursor: pointer;
-        user-select: none;
+      #zero-grid-assistant .zga-sel-list {
+        display: grid;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      #zero-grid-assistant .zga-sel-row {
+        display: grid;
+        gap: 4px;
+        padding: 8px;
+        background: #fff;
+        border: 1px solid #ececec;
+        border-radius: 8px;
+      }
+      #zero-grid-assistant .zga-sel-meta {
+        font-size: 11px;
+        color: #666;
       }
     `;
     document.head.appendChild(style);
@@ -676,6 +798,8 @@ Hinweis:
     const sellCheck = canSellAt500(g.sell);
     const effectiveAvailable = getEffectiveAvailableQty();
 
+    updateOrderUrls();
+
     byId('zga-buy').textContent = fmt.format(g.buy);
     byId('zga-sell').textContent = fmt.format(g.sell);
     byId('zga-next-buy').textContent = fmt.format(g.nextBuyAfterSell);
@@ -684,8 +808,9 @@ Hinweis:
     byId('zga-sell-minqty').textContent = `${sellQty} Stk (${fmt.format(round2(g.sell * sellQty))})`;
     byId('zga-auto-available').textContent = state.autoAvailableQty == null ? '—' : `${state.autoAvailableQty} Stk`;
     byId('zga-effective-available').textContent = effectiveAvailable == null ? '—' : `${effectiveAvailable} Stk`;
-    byId('zga-order-scan-status').textContent = state.lastOrderScan;
     byId('zga-holding-scan-status').textContent = state.lastHoldingScan;
+    byId('zga-buy-url').textContent = state.lastBuyUrl || '—';
+    byId('zga-sell-url').textContent = state.lastSellUrl || '—';
 
     const hints = [];
     if (state.lastPrice != null && !Number.isNaN(state.lastPrice)) {
@@ -708,7 +833,7 @@ Hinweis:
       hints.push(`Bestand unbekannt. Für Verkauf wären mindestens ${sellQty} Stk nötig.`);
     }
 
-    hints.push('Nur Vorbelegung. Kein Auto-Submit.');
+    hints.push(state.selectorDebugActive ? 'Selector-Debugger aktiv.' : 'URL-Modus aktiv. Kein Auto-Submit.');
     byId('zga-hint').textContent = hints.join(' ');
   }
 
@@ -720,7 +845,7 @@ Hinweis:
     });
 
     byId('zga-symbol').addEventListener('input', e => {
-      state.symbol = e.target.value;
+      state.symbol = e.target.value.trim();
       updateView();
       if (CONFIG.autoReadHolding) {
         clearTimeout(bindPanel._holdingTimer);
@@ -737,37 +862,36 @@ Hinweis:
       updateView();
     });
 
-    byId('zga-scan-order').addEventListener('click', scanOrderForm);
     byId('zga-read-holding').addEventListener('click', readAvailableQtyAuto);
-    byId('zga-apply-buy').addEventListener('click', () => fillOrder('buy'));
-    byId('zga-apply-sell').addEventListener('click', () => fillOrder('sell'));
-
-    byId('zga-copy-buy').addEventListener('click', () => {
-      const g = grid(state.anchor, state.step);
-      navigator.clipboard.writeText(g.buy.toFixed(2)).then(() => flash('Kaufpreis kopiert.', 'ok'));
-    });
-
-    byId('zga-copy-sell').addEventListener('click', () => {
-      const g = grid(state.anchor, state.step);
-      navigator.clipboard.writeText(g.sell.toFixed(2)).then(() => flash('Verkaufspreis kopiert.', 'ok'));
-    });
-
+    byId('zga-open-buy').addEventListener('click', () => openPreparedOrder('buy'));
+    byId('zga-open-sell').addEventListener('click', () => openPreparedOrder('sell'));
+    byId('zga-copy-buy').addEventListener('click', () => copyOrderUrl('buy'));
+    byId('zga-copy-sell').addEventListener('click', () => copyOrderUrl('sell'));
     byId('zga-copy-plan').addEventListener('click', copyPlan);
+
+    byId('zga-selector-debug-toggle').addEventListener('click', () => {
+      setSelectorDebug(!state.selectorDebugActive);
+      updateView();
+    });
+  }
+
+  function setupDebugListeners() {
+    document.addEventListener('mousemove', onDebugMouseMove, true);
+    document.addEventListener('click', onDebugClick, true);
+    document.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && state.selectorDebugActive) {
+        setSelectorDebug(false);
+        updateView();
+      }
+    }, true);
   }
 
   function setupObservers() {
-    if (CONFIG.autoScanOrderForm || CONFIG.autoReadHolding) {
+    if (CONFIG.autoReadHolding) {
       const mo = new MutationObserver(() => {
-        if (CONFIG.autoScanOrderForm) {
-          const current = findOrderForm();
-          if (current && (!state.formRef || state.formRef.form !== current)) scanOrderForm();
-        }
-        if (CONFIG.autoReadHolding) {
-          clearTimeout(setupObservers._t);
-          setupObservers._t = setTimeout(readAvailableQtyAuto, 700);
-        }
+        clearTimeout(setupObservers._t);
+        setupObservers._t = setTimeout(readAvailableQtyAuto, 700);
       });
-
       mo.observe(document.documentElement, { childList: true, subtree: true });
     }
   }
@@ -776,13 +900,10 @@ Hinweis:
     if (byId('zero-grid-assistant')) return;
     buildPanel();
     bindPanel();
+    setupDebugListeners();
     updateView();
     setupObservers();
-
-    setTimeout(() => {
-      scanOrderForm();
-      readAvailableQtyAuto();
-    }, 1200);
+    setTimeout(readAvailableQtyAuto, 1200);
   }
 
   if (document.readyState === 'loading') {
