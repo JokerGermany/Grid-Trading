@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         ZERO Grid Assistant v0.3
+// @name         ZERO Grid Assistant v0.4
 // @namespace    local.zero.grid.assistant
-// @version      0.3.0
-// @description  Assistives Grid-Overlay mit 500€-Mindestvolumen, Bestandsprüfung für Verkauf, ohne Auto-Submit
+// @version      0.4.0
+// @description  Assistives Grid-Overlay mit automatischem Bestands-Readout, 500€-Mindestvolumen und manueller Freigabe
 // @match        https://mein.finanzen-zero.net/*
 // @match        https://*.finanzen-zero.net/*
 // @grant        none
@@ -14,12 +14,14 @@
   const CONFIG = {
     minNotional: 500,
     preferGermanDecimal: true,
-    autoScan: true,
+    autoScanOrderForm: true,
+    autoReadHolding: true,
     symbol: 'ETF',
     anchor: 100.00,
     step: 0.50,
     qty: 1,
-    availableQty: '',
+    manualAvailableQty: '',
+
     selectors: {
       orderModal: [
         '[data-testid*="order"]',
@@ -59,7 +61,24 @@
           'button[aria-label*="Sell"]',
           'button'
         ]
-      }
+      },
+
+      positionContainers: [
+        'tr',
+        '[role="row"]',
+        '[data-testid*="position"]',
+        '[data-testid*="Position"]',
+        '[data-testid*="holding"]',
+        '[data-testid*="Holding"]',
+        '[class*="position"]',
+        '[class*="Position"]',
+        '[class*="holding"]',
+        '[class*="Holding"]',
+        'article',
+        'li',
+        'section',
+        'div'
+      ]
     }
   };
 
@@ -68,10 +87,12 @@
     anchor: CONFIG.anchor,
     step: CONFIG.step,
     qty: CONFIG.qty,
-    availableQty: CONFIG.availableQty,
+    manualAvailableQty: CONFIG.manualAvailableQty,
+    autoAvailableQty: null,
     lastPrice: null,
     panelOpen: true,
-    lastScanResult: 'Noch nicht gesucht',
+    lastOrderScan: 'Noch nicht gesucht',
+    lastHoldingScan: 'Noch nicht gesucht',
     formRef: null
   };
 
@@ -79,65 +100,6 @@
 
   function round2(v) {
     return Math.round((Number(v) + Number.EPSILON) * 100) / 100;
-  }
-
-  function isFiniteNumber(v) {
-    return Number.isFinite(Number(v));
-  }
-
-  function grid(anchor, step) {
-    anchor = round2(anchor);
-    step = round2(step);
-    return {
-      buy: round2(anchor - step),
-      sell: round2(anchor + step),
-      nextAnchorAfterSell: round2(anchor + step),
-      nextBuyAfterSell: round2(anchor),
-      nextSellAfterSell: round2(anchor + step * 2)
-    };
-  }
-
-  function minQtyForNotional(price, minNotional = CONFIG.minNotional) {
-    price = Number(price || 0);
-    if (!Number.isFinite(price) || price <= 0) return 1;
-    return Math.max(1, Math.ceil(minNotional / price));
-  }
-
-  function parseAvailableQty() {
-    if (state.availableQty === '' || state.availableQty == null) return null;
-    const v = Number(state.availableQty);
-    return Number.isFinite(v) && v >= 0 ? v : null;
-  }
-
-  function requiredBuyQty(price) {
-    return Math.max(Number(state.qty || 0), minQtyForNotional(price));
-  }
-
-  function requiredSellQty(price) {
-    return Math.max(Number(state.qty || 0), minQtyForNotional(price));
-  }
-
-  function canSellAt500(price) {
-    const required = requiredSellQty(price);
-    const available = parseAvailableQty();
-    if (available == null) return { ok: true, required, available: null };
-    return { ok: available >= required, required, available };
-  }
-
-  function numberToInputString(v) {
-    const s = round2(v).toFixed(2);
-    return CONFIG.preferGermanDecimal ? s.replace('.', ',') : s;
-  }
-
-  function setNativeValue(el, value) {
-    const prototype = Object.getPrototypeOf(el);
-    const desc = Object.getOwnPropertyDescriptor(prototype, 'value');
-    if (desc && desc.set) desc.set.call(el, value);
-    else el.value = value;
-
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'End' }));
   }
 
   function visible(el) {
@@ -161,14 +123,118 @@
     return [...new Set(out)];
   }
 
+  function escapeHtml(str) {
+    return String(str)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+  }
+
+  function normalizeText(s) {
+    return String(s || '')
+      .replace(/\u00A0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  function parseLocalizedNumber(raw) {
+    let s = String(raw || '').trim();
+    if (!s) return NaN;
+
+    s = s.replace(/\u00A0/g, ' ').replace(/\s+/g, '');
+    const hasComma = s.includes(',');
+    const hasDot = s.includes('.');
+
+    if (hasComma && hasDot) {
+      if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
+        s = s.replace(/\./g, '').replace(',', '.');
+      } else {
+        s = s.replace(/,/g, '');
+      }
+    } else if (hasComma) {
+      s = s.replace(/\./g, '').replace(',', '.');
+    } else {
+      const parts = s.split('.');
+      if (parts.length > 2) s = parts.join('');
+    }
+
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+
+  function grid(anchor, step) {
+    anchor = round2(anchor);
+    step = round2(step);
+    return {
+      buy: round2(anchor - step),
+      sell: round2(anchor + step),
+      nextAnchorAfterSell: round2(anchor + step),
+      nextBuyAfterSell: round2(anchor),
+      nextSellAfterSell: round2(anchor + step * 2)
+    };
+  }
+
+  function minQtyForNotional(price, minNotional = CONFIG.minNotional) {
+    price = Number(price || 0);
+    if (!Number.isFinite(price) || price <= 0) return 1;
+    return Math.max(1, Math.ceil(minNotional / price));
+  }
+
+  function getEffectiveAvailableQty() {
+    const manual = parseLocalizedNumber(state.manualAvailableQty);
+    if (Number.isFinite(manual) && manual >= 0) return manual;
+    return Number.isFinite(state.autoAvailableQty) ? state.autoAvailableQty : null;
+  }
+
+  function requiredBuyQty(price) {
+    return Math.max(Number(state.qty || 0), minQtyForNotional(price));
+  }
+
+  function requiredSellQty(price) {
+    return Math.max(Number(state.qty || 0), minQtyForNotional(price));
+  }
+
+  function canSellAt500(price) {
+    const required = requiredSellQty(price);
+    const available = getEffectiveAvailableQty();
+    if (available == null) return { ok: true, required, available: null };
+    return { ok: available >= required, required, available };
+  }
+
+  function numberToInputString(v) {
+    const s = round2(v).toFixed(2);
+    return CONFIG.preferGermanDecimal ? s.replace('.', ',') : s;
+  }
+
+  function setNativeValue(el, value) {
+    const prototype = Object.getPrototypeOf(el);
+    const desc = Object.getOwnPropertyDescriptor(prototype, 'value');
+    if (desc && desc.set) desc.set.call(el, value);
+    else el.value = value;
+
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'End' }));
+  }
+
+  function flash(msg, type = 'ok') {
+    const el = byId('zga-flash');
+    if (!el) return;
+    el.textContent = msg;
+    el.dataset.type = type;
+    el.hidden = false;
+    clearTimeout(flash._t);
+    flash._t = setTimeout(() => { el.hidden = true; }, 3500);
+  }
+
   function findByText(candidates, needles) {
     for (const needle of needles) {
       const low = needle.toLowerCase();
-      const match = candidates.find(el => {
-        const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-        return txt.includes(low);
-      });
-      if (match) return match;
+      const hit = candidates.find(el => normalizeText(el.innerText || el.textContent).includes(low));
+      if (hit) return hit;
     }
     return null;
   }
@@ -176,6 +242,7 @@
   function findOrderForm() {
     const candidates = qsa(CONFIG.selectors.orderModal).filter(visible);
     if (!candidates.length) return null;
+
     for (const c of candidates) {
       const inputs = [...c.querySelectorAll('input')].filter(visible);
       if (inputs.length >= 2) return c;
@@ -190,13 +257,16 @@
     const allInputs = [...root.querySelectorAll('input')].filter(visible);
     for (const input of allInputs) {
       const id = input.id;
-      const lbl = id ? root.querySelector(`label[for="${CSS.escape(id)}"]`) || document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-      const hay = [
+      const lbl = id
+        ? root.querySelector(`label[for="${CSS.escape(id)}"]`) || document.querySelector(`label[for="${CSS.escape(id)}"]`)
+        : null;
+
+      const hay = normalizeText([
         input.getAttribute('name') || '',
         input.getAttribute('placeholder') || '',
         input.getAttribute('aria-label') || '',
         lbl ? (lbl.innerText || lbl.textContent || '') : ''
-      ].join(' ').toLowerCase();
+      ].join(' '));
 
       if (labelWords.some(w => hay.includes(w))) return input;
     }
@@ -209,11 +279,11 @@
     return findByText(candidates, side === 'buy' ? ['kauf', 'buy'] : ['verkauf', 'sell']);
   }
 
-  function scanForm() {
+  function scanOrderForm() {
     const form = findOrderForm();
     if (!form) {
       state.formRef = null;
-      state.lastScanResult = 'Keine Ordermaske erkannt';
+      state.lastOrderScan = 'Keine Ordermaske erkannt';
       updateView();
       return null;
     }
@@ -224,14 +294,108 @@
     const sellTab = findActionTab(form, 'sell');
 
     state.formRef = { form, priceInput, qtyInput, buyTab, sellTab };
-    state.lastScanResult =
+    state.lastOrderScan =
       `Maske erkannt | Preis: ${!!priceInput} | Menge: ${!!qtyInput} | Kauf: ${!!buyTab} | Verkauf: ${!!sellTab}`;
     updateView();
     return state.formRef;
   }
 
   function ensureFormRef() {
-    return state.formRef || scanForm();
+    return state.formRef || scanOrderForm();
+  }
+
+  function buildNeedles() {
+    const raw = String(state.symbol || '').trim();
+    if (!raw) return [];
+    return raw
+      .split(/[|,/]+/)
+      .map(s => normalizeText(s))
+      .filter(Boolean);
+  }
+
+  function scoreCandidate(text, needles) {
+    let score = 0;
+    for (const n of needles) {
+      if (text.includes(n)) score += 5;
+    }
+    if (/\b(bestand|stück|stk|menge|position)\b/i.test(text)) score += 3;
+    score -= Math.min(text.length / 400, 3);
+    return score;
+  }
+
+  function extractQtyFromText(text) {
+    const patterns = [
+      /(?:bestand|verfügbar(?:er bestand)?|stückzahl|menge|position)\s*[:\-]?\s*([0-9][0-9.\s,]*)/i,
+      /([0-9][0-9.\s,]*)\s*(?:stk|stück|anteile?)\b/i,
+      /\b([0-9][0-9.\s,]*)\b(?=.*\b(?:stk|stück|anteile?|bestand)\b)/i
+    ];
+
+    for (const re of patterns) {
+      const m = text.match(re);
+      if (m && m[1]) {
+        const n = parseLocalizedNumber(m[1]);
+        if (Number.isFinite(n) && n >= 0) return n;
+      }
+    }
+    return null;
+  }
+
+  function readAvailableQtyAuto() {
+    const needles = buildNeedles();
+    if (!needles.length) {
+      state.autoAvailableQty = null;
+      state.lastHoldingScan = 'Kein Suchbegriff gesetzt';
+      updateView();
+      return null;
+    }
+
+    const all = qsa(CONFIG.selectors.positionContainers)
+      .filter(visible)
+      .map(el => ({ el, text: normalizeText(el.innerText || el.textContent || '') }))
+      .filter(x => x.text.length >= 10);
+
+    const matched = all
+      .filter(x => needles.some(n => x.text.includes(n)))
+      .map(x => ({ ...x, score: scoreCandidate(x.text, needles) }))
+      .sort((a, b) => b.score - a.score);
+
+    for (const candidate of matched) {
+      const scopes = [candidate.el];
+      let p = candidate.el.parentElement;
+      let depth = 0;
+      while (p && depth < 3) {
+        scopes.push(p);
+        p = p.parentElement;
+        depth++;
+      }
+
+      for (const scope of scopes) {
+        const txt = normalizeText(scope.innerText || scope.textContent || '');
+        const qty = extractQtyFromText(txt);
+        if (Number.isFinite(qty)) {
+          state.autoAvailableQty = qty;
+          state.lastHoldingScan = `Bestand automatisch erkannt: ${qty} Stk`;
+          updateView();
+          return qty;
+        }
+      }
+    }
+
+    const bodyText = normalizeText(document.body?.innerText || '');
+    if (needles.some(n => bodyText.includes(n))) {
+      const qty = extractQtyFromText(bodyText);
+      if (Number.isFinite(qty)) {
+        state.autoAvailableQty = qty;
+        state.lastHoldingScan = `Bestand global erkannt: ${qty} Stk`;
+        updateView();
+        return qty;
+      }
+    }
+
+    state.autoAvailableQty = null;
+    state.lastHoldingScan = `Kein Bestand für "${state.symbol}" erkannt`;
+    updateView();
+    return null;
   }
 
   function fillOrder(side) {
@@ -243,7 +407,7 @@
 
     const g = grid(state.anchor, state.step);
     const price = side === 'buy' ? g.buy : g.sell;
-    let qty = side === 'buy' ? requiredBuyQty(price) : requiredSellQty(price);
+    const qty = side === 'buy' ? requiredBuyQty(price) : requiredSellQty(price);
 
     if (side === 'sell') {
       const sellCheck = canSellAt500(price);
@@ -265,7 +429,6 @@
       ref.priceInput.focus();
       setNativeValue(ref.priceInput, numberToInputString(price));
     }
-
     if (ref.qtyInput) {
       ref.qtyInput.focus();
       setNativeValue(ref.qtyInput, String(qty));
@@ -275,37 +438,31 @@
       `${side === 'buy' ? 'Kauf' : 'Verkauf'} vorbereitet: ${numberToInputString(price)} × ${qty} = ${fmt.format(notional)}`,
       'ok'
     );
-    updatePreparedHint(side, price, qty, notional);
-  }
-
-  function updatePreparedHint(side, price, qty, notional) {
-    const el = byId('zga-hint');
-    if (!el) return;
-    el.textContent =
-      `${side === 'buy' ? 'Kauf' : 'Verkauf'} vorbereitet: Preis ${fmt.format(price)}, Menge ${qty}, Volumen ${fmt.format(notional)}. Mindestziel ${fmt.format(CONFIG.minNotional)} erfüllt.`;
+    byId('zga-hint').textContent =
+      `${side === 'buy' ? 'Kauf' : 'Verkauf'} vorbereitet: Preis ${fmt.format(price)}, Menge ${qty}, Volumen ${fmt.format(notional)}. Kein Auto-Submit.`;
   }
 
   function copyPlan() {
     const g = grid(state.anchor, state.step);
     const buyQty = requiredBuyQty(g.buy);
     const sellQty = requiredSellQty(g.sell);
-    const sellCheck = canSellAt500(g.sell);
+    const available = getEffectiveAvailableQty();
 
     const text =
-`Symbol: ${state.symbol}
+`Symbol/WKN/ISIN-Suchtext: ${state.symbol}
 Anchor: ${state.anchor.toFixed(2)}
 Abstand: ${state.step.toFixed(2)}
 
 Kauf:
 - Preis: ${g.buy.toFixed(2)}
-- Mindestmenge für >= ${CONFIG.minNotional} €: ${buyQty}
+- Menge für >= ${CONFIG.minNotional} €: ${buyQty}
 - Volumen: ${(g.buy * buyQty).toFixed(2)} €
 
 Verkauf:
 - Preis: ${g.sell.toFixed(2)}
-- Mindestmenge für >= ${CONFIG.minNotional} €: ${sellQty}
+- Menge für >= ${CONFIG.minNotional} €: ${sellQty}
 - Volumen: ${(g.sell * sellQty).toFixed(2)} €
-- Bestand ausreichend: ${sellCheck.ok ? 'ja' : 'nein'}
+- Verfügbarer Bestand: ${available == null ? 'unbekannt' : available}
 
 Nach Verkauf bei ${g.sell.toFixed(2)}:
 - Alte Kauforder ${g.buy.toFixed(2)} manuell prüfen/löschen
@@ -313,22 +470,10 @@ Nach Verkauf bei ${g.sell.toFixed(2)}:
 - Neue Verkaufsorder ${g.nextSellAfterSell.toFixed(2)} vorbereiten
 
 Hinweis:
-- Kein Auto-Submit
-- Finale Prüfung und Freigabe immer manuell`;
+- Finale Prüfung und Freigabe immer manuell
+- Kein Auto-Submit`;
 
     navigator.clipboard.writeText(text).then(() => flash('Ablauf kopiert.', 'ok'));
-  }
-
-  function flash(msg, type = 'ok') {
-    const el = byId('zga-flash');
-    if (!el) return;
-    el.textContent = msg;
-    el.dataset.type = type;
-    el.hidden = false;
-    clearTimeout(flash._t);
-    flash._t = setTimeout(() => {
-      el.hidden = true;
-    }, 3200);
   }
 
   function buildPanel() {
@@ -336,12 +481,13 @@ Hinweis:
     panel.id = 'zero-grid-assistant';
     panel.innerHTML = `
       <div class="zga-header">
-        <strong>ZERO Grid Assistant v0.3</strong>
-        <button id="zga-toggle" type="button" title="Ein-/Ausklappen">${state.panelOpen ? '–' : '+'}</button>
+        <strong>ZERO Grid Assistant v0.4</strong>
+        <button id="zga-toggle" type="button">${state.panelOpen ? '–' : '+'}</button>
       </div>
+
       <div class="zga-body" ${state.panelOpen ? '' : 'hidden'}>
-        <label>Symbol
-          <input id="zga-symbol" type="text" value="${escapeHtml(state.symbol)}">
+        <label>Symbol / WKN / ISIN
+          <input id="zga-symbol" type="text" value="${escapeHtml(state.symbol)}" placeholder="z.B. A1JX52 oder Vanguard FTSE All-World">
         </label>
 
         <div class="zga-cols">
@@ -357,8 +503,8 @@ Hinweis:
           <label>Basis-Menge
             <input id="zga-qty" type="number" step="1" min="1" value="${state.qty}">
           </label>
-          <label>Verfügbarer Bestand
-            <input id="zga-available" type="number" step="1" min="0" placeholder="optional">
+          <label>Bestand Override
+            <input id="zga-manual-available" type="number" step="0.0001" min="0" placeholder="optional">
           </label>
         </div>
 
@@ -373,20 +519,24 @@ Hinweis:
           <div>Nächster Verkauf</div><div id="zga-next-sell">-</div>
           <div>Kauf min. Menge</div><div id="zga-buy-minqty">-</div>
           <div>Verkauf min. Menge</div><div id="zga-sell-minqty">-</div>
+          <div>Auto-Bestand</div><div id="zga-auto-available">-</div>
+          <div>Effektiver Bestand</div><div id="zga-effective-available">-</div>
         </div>
 
         <div class="zga-status">
-          <div><strong>Scan:</strong> <span id="zga-scan-status">-</span></div>
+          <div><strong>Order-Scan:</strong> <span id="zga-order-scan-status">-</span></div>
+          <div><strong>Bestands-Scan:</strong> <span id="zga-holding-scan-status">-</span></div>
           <div id="zga-hint">Nur Vorbelegung. Kein Auto-Submit.</div>
         </div>
 
         <div class="zga-actions">
-          <button id="zga-scan" type="button">Maske suchen</button>
-          <button id="zga-copy-plan" type="button">Ablauf kopieren</button>
+          <button id="zga-scan-order" type="button">Maske suchen</button>
+          <button id="zga-read-holding" type="button">Bestand lesen</button>
           <button id="zga-apply-buy" type="button">Kauf vorbefüllen</button>
           <button id="zga-apply-sell" type="button">Verkauf vorbefüllen</button>
           <button id="zga-copy-buy" type="button">Kaufpreis kopieren</button>
           <button id="zga-copy-sell" type="button">Verkaufspreis kopieren</button>
+          <button id="zga-copy-plan" type="button">Ablauf kopieren</button>
         </div>
 
         <div id="zga-flash" class="zga-flash" hidden></div>
@@ -394,11 +544,11 @@ Hinweis:
         <details>
           <summary>Hinweise</summary>
           <p class="zga-small">
-            Verkauf wird blockiert, wenn der eingetragene verfügbare Bestand kleiner ist als die
-            Mindestmenge für ein Volumen von mindestens ${CONFIG.minNotional} €.
+            Trage im Feld „Symbol / WKN / ISIN“ möglichst einen eindeutigen Suchbegriff ein.
+            WKN oder ISIN ist meist robuster als nur der ETF-Name.
           </p>
           <p class="zga-small">
-            Falls ZERO die Oberfläche ändert, ergänze oben passende Selektoren in CONFIG.selectors.
+            Wenn der Auto-Bestand nicht erkannt wird, kannst du weiterhin einen manuellen Override eintragen.
           </p>
         </details>
       </div>
@@ -412,7 +562,7 @@ Hinweis:
         top: 16px;
         right: 16px;
         z-index: 2147483647;
-        width: 380px;
+        width: 400px;
         max-width: calc(100vw - 24px);
         background: #fff;
         color: #111;
@@ -474,6 +624,9 @@ Hinweis:
         grid-template-columns: 1fr 1fr;
         gap: 8px;
       }
+      #zero-grid-assistant .zga-actions button:last-child {
+        grid-column: 1 / -1;
+      }
       #zero-grid-assistant button {
         padding: 9px 10px;
         border: 1px solid #bdbdbd;
@@ -482,9 +635,7 @@ Hinweis:
         color: #111;
         cursor: pointer;
       }
-      #zero-grid-assistant button:hover {
-        background: #f0f0f0;
-      }
+      #zero-grid-assistant button:hover { background: #f0f0f0; }
       #zero-grid-assistant .zga-flash {
         padding: 8px 10px;
         border-radius: 8px;
@@ -518,54 +669,43 @@ Hinweis:
     document.head.appendChild(style);
   }
 
-  function escapeHtml(str) {
-    return String(str)
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;')
-      .replaceAll("'", '&#039;');
-  }
-
   function updateView() {
     const g = grid(state.anchor, state.step);
-    const buyMinQty = minQtyForNotional(g.buy);
-    const sellMinQty = minQtyForNotional(g.sell);
     const buyQty = requiredBuyQty(g.buy);
     const sellQty = requiredSellQty(g.sell);
     const sellCheck = canSellAt500(g.sell);
+    const effectiveAvailable = getEffectiveAvailableQty();
 
     byId('zga-buy').textContent = fmt.format(g.buy);
     byId('zga-sell').textContent = fmt.format(g.sell);
     byId('zga-next-buy').textContent = fmt.format(g.nextBuyAfterSell);
     byId('zga-next-sell').textContent = fmt.format(g.nextSellAfterSell);
     byId('zga-buy-minqty').textContent = `${buyQty} Stk (${fmt.format(round2(g.buy * buyQty))})`;
-    byId('zga-sell-minqty').textContent =
-      `${sellQty} Stk (${fmt.format(round2(g.sell * sellQty))})${sellCheck.ok ? '' : ' — Bestand zu klein'}`;
-    byId('zga-scan-status').textContent = state.lastScanResult;
+    byId('zga-sell-minqty').textContent = `${sellQty} Stk (${fmt.format(round2(g.sell * sellQty))})`;
+    byId('zga-auto-available').textContent = state.autoAvailableQty == null ? '—' : `${state.autoAvailableQty} Stk`;
+    byId('zga-effective-available').textContent = effectiveAvailable == null ? '—' : `${effectiveAvailable} Stk`;
+    byId('zga-order-scan-status').textContent = state.lastOrderScan;
+    byId('zga-holding-scan-status').textContent = state.lastHoldingScan;
 
     const hints = [];
     if (state.lastPrice != null && !Number.isNaN(state.lastPrice)) {
-      if (state.lastPrice >= g.sell) {
-        hints.push(`Verkaufsschwelle erreicht: ${fmt.format(state.lastPrice)} >= ${fmt.format(g.sell)}.`);
-      } else if (state.lastPrice <= g.buy) {
-        hints.push(`Kaufschwelle erreicht: ${fmt.format(state.lastPrice)} <= ${fmt.format(g.buy)}.`);
-      } else {
-        hints.push(`Im Korridor: ${fmt.format(g.buy)} bis ${fmt.format(g.sell)}.`);
-      }
+      if (state.lastPrice >= g.sell) hints.push(`Verkaufsschwelle erreicht: ${fmt.format(state.lastPrice)} >= ${fmt.format(g.sell)}.`);
+      else if (state.lastPrice <= g.buy) hints.push(`Kaufschwelle erreicht: ${fmt.format(state.lastPrice)} <= ${fmt.format(g.buy)}.`);
+      else hints.push(`Im Korridor: ${fmt.format(g.buy)} bis ${fmt.format(g.sell)}.`);
     } else {
       hints.push('Kein letzter Kurs gesetzt.');
     }
 
-    hints.push(`Kauf immer >= ${fmt.format(CONFIG.minNotional)} mit mindestens ${buyMinQty} Stk.`);
-    if (sellCheck.available != null) {
+    hints.push(`Kauf immer >= ${fmt.format(CONFIG.minNotional)} mit mindestens ${buyQty} Stk.`);
+
+    if (effectiveAvailable != null) {
       hints.push(
         sellCheck.ok
-          ? `Verkauf möglich: Bestand ${sellCheck.available} Stk reicht für mindestens ${sellMinQty} Stk.`
-          : `Verkauf blockiert: Bestand ${sellCheck.available} Stk kleiner als nötig (${sellMinQty} Stk).`
+          ? `Verkauf möglich: Bestand ${effectiveAvailable} Stk reicht für mindestens ${sellQty} Stk.`
+          : `Verkauf blockiert: Bestand ${effectiveAvailable} Stk kleiner als nötig (${sellQty} Stk).`
       );
     } else {
-      hints.push(`Für Verkauf sind mindestens ${sellMinQty} Stk nötig, falls ebenfalls >= ${fmt.format(CONFIG.minNotional)} erreicht werden soll.`);
+      hints.push(`Bestand unbekannt. Für Verkauf wären mindestens ${sellQty} Stk nötig.`);
     }
 
     hints.push('Nur Vorbelegung. Kein Auto-Submit.');
@@ -579,17 +719,26 @@ Hinweis:
       byId('zga-toggle').textContent = state.panelOpen ? '–' : '+';
     });
 
-    byId('zga-symbol').addEventListener('input', e => { state.symbol = e.target.value; });
+    byId('zga-symbol').addEventListener('input', e => {
+      state.symbol = e.target.value;
+      updateView();
+      if (CONFIG.autoReadHolding) {
+        clearTimeout(bindPanel._holdingTimer);
+        bindPanel._holdingTimer = setTimeout(readAvailableQtyAuto, 400);
+      }
+    });
+
     byId('zga-anchor').addEventListener('input', e => { state.anchor = Number(e.target.value || 0); updateView(); });
     byId('zga-step').addEventListener('input', e => { state.step = Number(e.target.value || 0); updateView(); });
     byId('zga-qty').addEventListener('input', e => { state.qty = Number(e.target.value || 0); updateView(); });
-    byId('zga-available').addEventListener('input', e => { state.availableQty = e.target.value; updateView(); });
+    byId('zga-manual-available').addEventListener('input', e => { state.manualAvailableQty = e.target.value; updateView(); });
     byId('zga-last').addEventListener('input', e => {
       state.lastPrice = e.target.value === '' ? null : Number(e.target.value);
       updateView();
     });
 
-    byId('zga-scan').addEventListener('click', () => scanForm());
+    byId('zga-scan-order').addEventListener('click', scanOrderForm);
+    byId('zga-read-holding').addEventListener('click', readAvailableQtyAuto);
     byId('zga-apply-buy').addEventListener('click', () => fillOrder('buy'));
     byId('zga-apply-sell').addEventListener('click', () => fillOrder('sell'));
 
@@ -606,14 +755,21 @@ Hinweis:
     byId('zga-copy-plan').addEventListener('click', copyPlan);
   }
 
-  function setupObserver() {
-    if (!CONFIG.autoScan) return;
-    const mo = new MutationObserver(() => {
-      const current = findOrderForm();
-      if (!current) return;
-      if (!state.formRef || state.formRef.form !== current) scanForm();
-    });
-    mo.observe(document.documentElement, { childList: true, subtree: true });
+  function setupObservers() {
+    if (CONFIG.autoScanOrderForm || CONFIG.autoReadHolding) {
+      const mo = new MutationObserver(() => {
+        if (CONFIG.autoScanOrderForm) {
+          const current = findOrderForm();
+          if (current && (!state.formRef || state.formRef.form !== current)) scanOrderForm();
+        }
+        if (CONFIG.autoReadHolding) {
+          clearTimeout(setupObservers._t);
+          setupObservers._t = setTimeout(readAvailableQtyAuto, 700);
+        }
+      });
+
+      mo.observe(document.documentElement, { childList: true, subtree: true });
+    }
   }
 
   function init() {
@@ -621,8 +777,12 @@ Hinweis:
     buildPanel();
     bindPanel();
     updateView();
-    setupObserver();
-    setTimeout(scanForm, 1200);
+    setupObservers();
+
+    setTimeout(() => {
+      scanOrderForm();
+      readAvailableQtyAuto();
+    }, 1200);
   }
 
   if (document.readyState === 'loading') {
